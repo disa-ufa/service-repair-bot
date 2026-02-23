@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+app.db
+*.sqlite3
+*.log
+config.yml
+data/
+.env
+*.bak
+*.db
+*.sqlite*
+Новый текстовый документ.txt

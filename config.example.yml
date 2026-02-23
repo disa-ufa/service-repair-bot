@@ -1,0 +1,19 @@
+# Пример конфигурации. Скопируйте в config.yml и заполните.
+# ВАЖНО: config.yml добавлен в .gitignore — токен не должен попадать в Git.
+
+bot_token: "PUT_YOUR_TELEGRAM_BOT_TOKEN"
+admins: [123456789]
+
+# Рекомендуется хранить SQLite в папке data/ (удобно для Docker volume / бэкапов)
+db_url: "sqlite+aiosqlite:///./data/app.db"
+
+# необязательно, если у вас нет общего чата мастеров на старте
+masters_chat_id: null
+
+business:
+  no_accept_alert_minutes: 50
+  second_message_text: "Нет на месте"
+  payout_requisites_text: "Банк: —\nТелефон: —"
+
+logging:
+  level: "INFO"

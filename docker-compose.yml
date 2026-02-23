@@ -1,0 +1,12 @@
+services:
+  bot:
+    build: .
+    container_name: service-repair-bot
+    restart: unless-stopped
+    environment:
+      - TZ=Europe/Istanbul
+    volumes:
+      # Персистентные данные (SQLite, файлы/загрузки если появятся)
+      - ./data:/app/data
+      # Конфиг НЕ коммитим — лежит рядом на сервере, монтируется как read-only
+      - ./config.yml:/app/config.yml:ro
