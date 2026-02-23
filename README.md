@@ -1,3 +1,4 @@
+[![CI](https://github.com/disa-ufa/service-repair-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/disa-ufa/service-repair-bot/actions/workflows/ci.yml)
 # Telegram-бот (aiogram 3) — текущая версия
 
 Сейчас реализовано:
