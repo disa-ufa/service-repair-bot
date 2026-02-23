@@ -297,3 +297,101 @@ async def list_master_payout_orders(master_id: int, days: int = 30, limit: int =
                 }
             )
         return out
+
+
+# ---------------------------
+# Export (Excel)
+# ---------------------------
+async def export_orders_and_masters() -> tuple[list[dict], list[dict]]:
+    """Выгрузка базы заявок и мастеров для Excel.
+
+    Возвращает:
+      - orders: список dict (готовые примитивы/строки/числа/даты)
+      - masters: список dict
+    """
+    sm = get_sessionmaker()
+    async with sm() as s:
+        orders_q = (
+            select(Order)
+            .options(
+                selectinload(Order.offer),
+                selectinload(Order.assigned_master),
+                selectinload(Order.created_by),
+            )
+            .order_by(Order.id.asc())
+        )
+        orders = list((await s.scalars(orders_q)).all())
+
+        masters_q = (
+            select(User)
+            .where(User.role.in_([Role.MASTER, Role.FIRED]))
+            .options(selectinload(User.offers))
+            .order_by(User.role.asc(), User.fio.asc(), User.id.asc())
+        )
+        masters = list((await s.scalars(masters_q)).all())
+
+    orders_out: list[dict] = []
+    for o in orders:
+        offer_title = o.offer.title if getattr(o, "offer", None) else ""
+        am = getattr(o, "assigned_master", None)
+        cb = getattr(o, "created_by", None)
+
+        orders_out.append(
+            {
+                "id": int(o.id),
+                "status": getattr(o.status, "value", str(o.status)),
+                "order_type": getattr(o.order_type, "value", str(o.order_type)),
+                "created_at": getattr(o, "created_at", None),
+                "updated_at": getattr(o, "updated_at", None),
+                "accepted_at": getattr(o, "accepted_at", None),
+                "closed_at": getattr(o, "closed_at", None),
+                "paid_at": getattr(o, "paid_at", None),
+                "city": getattr(o, "city", None) or "",
+                "offer": offer_title,
+                "client_name": getattr(o, "client_name", "") or "",
+                "client_phone": getattr(o, "client_phone", "") or "",
+                "address": getattr(o, "address", "") or "",
+                "apartment": getattr(o, "apartment", None) or "",
+                "source": getattr(o, "source", None) or "",
+                "problem": getattr(o, "problem", "") or "",
+                "modernization_comment": getattr(o, "modernization_comment", None) or "",
+                "total_amount": getattr(o, "total_amount", None),
+                "expense_amount": getattr(o, "expense_amount", None),
+                "net_amount": getattr(o, "net_amount", None),
+                "company_amount": getattr(o, "company_amount", None),
+                "percent_master_snapshot": getattr(o, "percent_master_snapshot", None),
+                "warranty_days": getattr(o, "warranty_days", None),
+                "close_comment": getattr(o, "close_comment", None) or "",
+                "has_payout_proof": 1 if getattr(o, "payout_screenshot_file_id", None) else 0,
+                "alerted_no_accept": 1 if getattr(o, "alerted_no_accept", False) else 0,
+                "assigned_master_id": int(am.id) if am else "",
+                "assigned_master_tg_id": int(am.tg_id) if am else "",
+                "assigned_master_fio": (am.fio if am else "") or "",
+                "created_by_id": int(cb.id) if cb else "",
+                "created_by_tg_id": int(cb.tg_id) if cb else "",
+                "created_by_fio": (cb.fio if cb else "") or "",
+            }
+        )
+
+    masters_out: list[dict] = []
+    for u in masters:
+        offers = getattr(u, "offers", None) or []
+        offers_titles = ", ".join([o.title for o in offers if getattr(o, "title", None)])
+        masters_out.append(
+            {
+                "id": int(u.id),
+                "tg_id": int(u.tg_id),
+                "fio": getattr(u, "fio", "") or "",
+                "username": getattr(u, "username", None) or "",
+                "role": getattr(u.role, "value", str(u.role)),
+                "city": getattr(u, "city", None) or "",
+                "percent_master": int(getattr(u, "percent_master", 0) or 0),
+                "is_approved": 1 if getattr(u, "is_approved", False) else 0,
+                "offers": offers_titles,
+                "created_at": getattr(u, "created_at", None),
+                "updated_at": getattr(u, "updated_at", None),
+            }
+        )
+
+    return orders_out, masters_out
+

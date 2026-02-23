@@ -20,6 +20,7 @@ try:
         BTN_CASH,
         BTN_PAYOUTS,
         BTN_MASTERS_SUMMARY,
+        BTN_EXPORT_EXCEL,
     )
 except Exception:  # pragma: no cover
     BTN_CREATE_ORDER = "➕ Создать заявку"
@@ -35,6 +36,7 @@ except Exception:  # pragma: no cover
     BTN_CASH = "💵 Касса"
     BTN_PAYOUTS = "💰 Выплаты"
     BTN_MASTERS_SUMMARY = "👷 Сводка по мастерам"
+    BTN_EXPORT_EXCEL = "📤 Экспорт в Excel"
 
 
 def _kb(rows: list[list[str]]) -> ReplyKeyboardMarkup:
@@ -60,6 +62,7 @@ def menu_for_role(role: Role) -> ReplyKeyboardMarkup:
                 [BTN_DISPATCHERS],  # ✅ НОВОЕ
                 [BTN_PAYOUTS],
                 [BTN_MASTERS_SUMMARY],
+                [BTN_EXPORT_EXCEL],
                 [BTN_STATS],
                 [BTN_RESET],
             ]

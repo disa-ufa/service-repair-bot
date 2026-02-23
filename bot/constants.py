@@ -31,6 +31,9 @@ BTN_CASH = "💵 Касса"
 BTN_PAYOUTS = "💰 Выплаты"
 BTN_MASTERS_SUMMARY = "👷 Сводка по мастерам"
 
+# SUPER_ADMIN: экспорт данных
+BTN_EXPORT_EXCEL = "📤 Экспорт в Excel"
+
 BTN_BACK = "↩️ Назад"
 
 

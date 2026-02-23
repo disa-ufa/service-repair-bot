@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import csv
 from datetime import datetime, timedelta
-from io import StringIO
+from io import StringIO, BytesIO
 from typing import Tuple
 
-from aiogram import Router
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font
+from openpyxl.utils import get_column_letter
+
+from aiogram import Router, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, Message
 
 from bot.db import repo
-from bot.db.models import OrderStatus, Role
+from bot.db.models import OrderStatus, OrderType, Role
+
+from bot.constants import BTN_EXPORT_EXCEL, order_status_label, order_type_label
 
 router = Router()
 
@@ -249,3 +255,188 @@ async def masters_summary_csv_cmd(message: Message):
     data = ("\ufeff" + out.getvalue()).encode("utf-8")
     fname = f"masters_summary_{label.replace(' ', '').replace('.', '').replace('–', '-')}.csv"
     await message.answer_document(BufferedInputFile(data, filename=fname))
+
+
+# ---------------------------
+# Export to Excel (SUPER_ADMIN)
+# ---------------------------
+
+def _fmt_dt(dt: datetime | None) -> str:
+    if not dt:
+        return ""
+    # в БД могут быть aware/naive — в Excel кладём строкой
+    try:
+        return dt.isoformat(sep=" ", timespec="seconds")
+    except Exception:
+        return str(dt)
+
+
+def _xlsx_build(orders: list[dict], masters: list[dict]) -> bytes:
+    wb = Workbook()
+
+    def write_sheet(title: str, rows: list[dict], columns: list[tuple[str, str]]):
+        ws = wb.create_sheet(title)
+        ws.append([col_title for _, col_title in columns])
+
+        header_font = Font(bold=True)
+        for cell in ws[1]:
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        for r in rows:
+            ws.append([r.get(key, "") for key, _ in columns])
+
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+
+        # авто-ширина колонок (с ограничением)
+        for idx, (key, _) in enumerate(columns, start=1):
+            max_len = len(str(key))
+            for row in ws.iter_rows(min_row=1, min_col=idx, max_col=idx):
+                v = row[0].value
+                if v is None:
+                    continue
+                s = str(v)
+                if len(s) > max_len:
+                    max_len = len(s)
+            max_len = min(60, max(10, max_len + 2))
+            ws.column_dimensions[get_column_letter(idx)].width = float(max_len)
+
+        # выравнивание данных
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+        return ws
+
+    # Первая страница должна быть активной — переименуем дефолтный лист
+    wb.remove(wb.active)
+
+    # Orders
+    orders_cols = [
+        ("id", "ID"),
+        ("status", "status"),
+        ("status_label", "Статус"),
+        ("order_type", "type"),
+        ("order_type_label", "Тип"),
+        ("created_at", "created_at"),
+        ("updated_at", "updated_at"),
+        ("accepted_at", "accepted_at"),
+        ("closed_at", "closed_at"),
+        ("paid_at", "paid_at"),
+        ("city", "Город"),
+        ("offer", "Техника"),
+        ("client_name", "Клиент"),
+        ("client_phone", "Телефон"),
+        ("address", "Адрес"),
+        ("apartment", "Кв."),
+        ("source", "Источник"),
+        ("problem", "Неисправность"),
+        ("modernization_comment", "Комментарий (ДР)"),
+        ("total_amount", "Сумма (получено)"),
+        ("expense_amount", "Запчасти"),
+        ("net_amount", "Чистыми"),
+        ("company_amount", "К сдаче"),
+        ("percent_master_snapshot", "% мастера (на момент)"),
+        ("warranty_days", "Гарантия (дней)"),
+        ("close_comment", "Комментарий закрытия"),
+        ("has_payout_proof", "Скрин сдачи"),
+        ("alerted_no_accept", "50мин алерт"),
+        ("assigned_master_id", "master_id"),
+        ("assigned_master_tg_id", "master_tg_id"),
+        ("assigned_master_fio", "Мастер"),
+        ("created_by_id", "created_by_id"),
+        ("created_by_tg_id", "created_by_tg_id"),
+        ("created_by_fio", "Создал"),
+    ]
+
+    # Masters
+    masters_cols = [
+        ("id", "ID"),
+        ("tg_id", "tg_id"),
+        ("fio", "ФИО"),
+        ("username", "username"),
+        ("role", "role"),
+        ("city", "Город"),
+        ("percent_master", "% мастера"),
+        ("is_approved", "Подтверждён"),
+        ("offers", "Техника/офферы"),
+        ("created_at", "created_at"),
+        ("updated_at", "updated_at"),
+    ]
+
+    write_sheet("Orders", orders, orders_cols)
+    write_sheet("Masters", masters, masters_cols)
+
+    # сделать первый лист активным
+    wb.active = 0
+
+    bio = BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
+def _enrich_export_labels(orders: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for r in orders:
+        status_val = (r.get("status") or "").strip()
+        type_val = (r.get("order_type") or "").strip()
+
+        # label'ы через Enum, если значение валидное
+        try:
+            st_enum = OrderStatus(status_val)
+            st_label = order_status_label(st_enum)
+        except Exception:
+            st_label = status_val
+
+        try:
+            t_enum = OrderType(type_val)
+            t_label = order_type_label(t_enum)
+        except Exception:
+            t_label = type_val
+
+        rr = dict(r)
+        rr["status_label"] = st_label
+        rr["order_type_label"] = t_label
+        rr["created_at"] = _fmt_dt(r.get("created_at"))
+        rr["updated_at"] = _fmt_dt(r.get("updated_at"))
+        rr["accepted_at"] = _fmt_dt(r.get("accepted_at"))
+        rr["closed_at"] = _fmt_dt(r.get("closed_at"))
+        rr["paid_at"] = _fmt_dt(r.get("paid_at"))
+        out.append(rr)
+    return out
+
+
+def _enrich_masters_dates(masters: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for r in masters:
+        rr = dict(r)
+        rr["created_at"] = _fmt_dt(r.get("created_at"))
+        rr["updated_at"] = _fmt_dt(r.get("updated_at"))
+        out.append(rr)
+    return out
+
+
+@router.message(Command("export_excel"))
+@router.message(F.text == BTN_EXPORT_EXCEL)
+async def export_excel_cmd(message: Message):
+    u = await repo.get_user_by_tg_id(message.from_user.id)
+    if not u:
+        await message.answer("Вы не зарегистрированы. Нажмите /start")
+        return
+    if u.role != Role.SUPER_ADMIN:
+        await message.answer("Недостаточно прав. Экспорт доступен только супер-администратору.")
+        return
+
+    await message.answer("Готовлю выгрузку Excel…")
+
+    orders, masters = await repo.export_orders_and_masters()
+    orders = _enrich_export_labels(orders)
+    masters = _enrich_masters_dates(masters)
+
+    data = _xlsx_build(orders, masters)
+    fname = f"export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    await message.answer_document(
+        BufferedInputFile(data, filename=fname),
+        caption=f"Выгрузка базы: заказы={len(orders)}, мастера={len(masters)}",
+    )

@@ -54,6 +54,96 @@ def _kb_inline(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+async def _refresh_dispatch_for_order_if_needed(
+    order_id: int,
+    *,
+    bot: Bot,
+    cfg: Config,
+) -> int:
+    """Обновить рассылку по заявке, если она ещё NEW и не назначена мастеру.
+
+    Логика:
+    - удаляем старые уведомления мастерам (по сохранённым chat_id/message_id)
+    - очищаем записи рассылки в БД
+    - отправляем уведомления новой группе мастеров (по текущим offer_id/city)
+      и сохраняем новые chat_id/message_id
+
+    Возвращает количество успешно отправленных уведомлений.
+    """
+
+    try:
+        order, _created_by, _assigned = await repo.get_order_with_users(order_id)
+    except Exception:
+        return 0
+
+    if not order:
+        return 0
+
+    # Если заявка уже не в NEW или уже назначена — рассылка не требуется.
+    if getattr(order, "status", None) != OrderStatus.NEW or getattr(order, "assigned_master_id", None) is not None:
+        return 0
+
+    # 1) удалить старую рассылку (по сохранённым сообщениям)
+    try:
+        delivered = await repo.list_order_dispatch_messages(order.id)
+        for dm in delivered:
+            try:
+                await bot.delete_message(chat_id=dm.chat_id, message_id=dm.message_id)
+            except Exception:
+                pass
+        await repo.delete_order_dispatch_messages(order_id=order.id)
+    except Exception:
+        # даже если часть не удалится — всё равно попробуем разослать заново
+        try:
+            await repo.delete_order_dispatch_messages(order_id=order.id)
+        except Exception:
+            pass
+
+    # 2) разослать новой группе мастеров
+    try:
+        masters = await repo.find_masters_for_order(offer_id=order.offer_id, city=order.city)
+    except Exception:
+        masters = []
+
+    tech_title = order.offer.title if getattr(order, "offer", None) else "—"
+    percent_master = int(getattr(order, "percent_master_snapshot", None) or 50)
+
+    public_text = _public_order_text(
+        order.id,
+        order.order_type,
+        order.city,
+        tech_title,
+        order.address,
+        getattr(order, "problem", "") or "",
+        percent_master,
+    )
+
+    sent = 0
+    for m in masters:
+        try:
+            msg = await bot.send_message(
+                m.tg_id,
+                public_text,
+                reply_markup=_order_accept_kb(order.id),
+                parse_mode=ParseMode.HTML,
+            )
+            if m.id is not None:
+                await repo.upsert_order_dispatch_message(
+                    order_id=order.id,
+                    user_id=m.id,
+                    chat_id=msg.chat.id,
+                    message_id=msg.message_id,
+                )
+            sent += 1
+        except Exception:
+            continue
+
+    # В чат мастеров при редактировании НЕ дублируем, чтобы не спамить общий канал.
+    # (На создании заявки рассылка в общий чат делается отдельно.)
+    _ = cfg  # cfg оставлен на будущее (например, если захотите включить пересылку в общий чат)
+    return sent
+
+
 async def _get_user_or_ask_start(message: Message):
     u = await repo.get_user_by_tg_id(message.from_user.id)
     if not u:
@@ -66,24 +156,7 @@ async def _get_user_or_ask_start(message: Message):
 
 
 async def _notify_admins(bot: Bot, cfg: Config, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None):
-    """Уведомить всех админов: супер-админов и диспетчеров + tg_id из cfg.admins (fallback)."""
-    recipients: set[int] = set()
-    try:
-        recipients.update(int(x) for x in (cfg.admins or []))
-    except Exception:
-        pass
-
-    # Берём роли из БД (если БД доступна)
-    try:
-        supers = await repo.list_users_by_role(Role.SUPER_ADMIN)
-        disps = await repo.list_users_by_role(Role.DISPATCHER)
-        for uu in list(supers) + list(disps):
-            if getattr(uu, "tg_id", None):
-                recipients.add(int(uu.tg_id))
-    except Exception:
-        pass
-
-    for admin_tg_id in recipients:
+    for admin_tg_id in cfg.admins:
         try:
             await bot.send_message(admin_tg_id, text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
         except Exception:
@@ -402,7 +475,7 @@ async def _admin_render_order_card(order_id: int, admin_role: Role) -> tuple[str
         act_cnt,
         has_payout,
         order.assigned_master_id,
-        allow_paid_confirm=(admin_role == Role.SUPER_ADMIN),
+        allow_paid_confirm=(admin_role in (Role.SUPER_ADMIN, Role.DISPATCHER)),
     )
     return text, kb
 
@@ -607,7 +680,7 @@ async def admin_edit_set_percent(cb: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data.startswith("oe_offer:"))
-async def admin_edit_set_offer(cb: CallbackQuery, state: FSMContext):
+async def admin_edit_set_offer(cb: CallbackQuery, state: FSMContext, bot: Bot, cfg: Config):
     if not cb.message:
         return
 
@@ -624,6 +697,10 @@ async def admin_edit_set_offer(cb: CallbackQuery, state: FSMContext):
         await cb.answer("Ошибка", show_alert=True)
         return
 
+    # Сравним со старым значением, чтобы не делать лишних пересылок.
+    old = await repo.get_order(order_id)
+    old_offer_id = getattr(old, "offer_id", None) if old else None
+
     order = await repo.admin_update_order_fields(order_id, offer_id=offer_id)
     if not order:
         await cb.answer("Не удалось сохранить (проверьте статус)", show_alert=True)
@@ -634,6 +711,17 @@ async def admin_edit_set_offer(cb: CallbackQuery, state: FSMContext):
         f"✅ Техника по заявке <b>#{order_id}</b> обновлена.",
         parse_mode=ParseMode.HTML,
     )
+
+    # Если заявка ещё NEW и не принята — удаляем старую рассылку и пересылаем новой группе мастеров.
+    try:
+        if old_offer_id is None or int(old_offer_id) != int(offer_id):
+            sent = await _refresh_dispatch_for_order_if_needed(order_id, bot=bot, cfg=cfg)
+            if sent:
+                await cb.message.answer(f"📨 Рассылка обновлена: отправлено <b>{sent}</b> мастерам.", parse_mode=ParseMode.HTML)
+            else:
+                await cb.message.answer("📨 Рассылка обновлена.", parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
 
     # Покажем актуальную карточку (меню редактирования не открываем автоматически)
     try:
@@ -680,7 +768,7 @@ async def admin_edit_offer_other(cb: CallbackQuery, state: FSMContext):
 
 
 @router.message(EditOrder.value, F.text, ~F.text.startswith("/"))
-async def admin_edit_value(message: Message, state: FSMContext):
+async def admin_edit_value(message: Message, state: FSMContext, bot: Bot, cfg: Config):
     u = await repo.get_user_by_tg_id(message.from_user.id)
     if not u:
         await state.clear()
@@ -719,6 +807,10 @@ async def admin_edit_value(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("Нельзя редактировать оплаченные заявки.")
         return
+
+    # Запомним старые значения для решения: нужно ли пересылать заявку мастерам.
+    old_offer_id = getattr(order, "offer_id", None)
+    old_city = (getattr(order, "city", None) or None)
 
     updates = {}
 
@@ -764,6 +856,19 @@ async def admin_edit_value(message: Message, state: FSMContext):
     await state.clear()
 
     await message.answer(f"✅ Сохранено для заявки <b>#{order_id}</b>.", parse_mode=ParseMode.HTML)
+
+    # Если меняли город или технику (offer) для NEW-заявки — обновим рассылку.
+    try:
+        new_offer_id = updates.get("offer_id", old_offer_id)
+        new_city = updates.get("city", old_city)
+        if (new_offer_id != old_offer_id) or (new_city != old_city):
+            sent = await _refresh_dispatch_for_order_if_needed(order_id, bot=bot, cfg=cfg)
+            if sent:
+                await message.answer(f"📨 Рассылка обновлена: отправлено <b>{sent}</b> мастерам.", parse_mode=ParseMode.HTML)
+            else:
+                await message.answer("📨 Рассылка обновлена.", parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
 
     # Покажем актуальную карточку
     try:
@@ -1226,7 +1331,7 @@ async def order_view(cb: CallbackQuery):
             act_cnt,
             has_payout,
             order.assigned_master_id,
-            allow_paid_confirm=(u.role == Role.SUPER_ADMIN),
+            allow_paid_confirm=(u.role in (Role.SUPER_ADMIN, Role.DISPATCHER)),
         )
 
     await cb.message.answer(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
@@ -1427,6 +1532,19 @@ async def admin_assign_master_apply(cb: CallbackQuery, bot: Bot, cfg: Config):
         await cb.answer("Не удалось назначить (проверьте статус)", show_alert=True)
         return
 
+    # При принудительном назначении — удаляем старую рассылку NEW-заявки у всех мастеров
+    # (чтобы никто больше не пытался принять старое сообщение).
+    try:
+        delivered = await repo.list_order_dispatch_messages(order.id)
+        for dm in delivered:
+            try:
+                await bot.delete_message(chat_id=dm.chat_id, message_id=dm.message_id)
+            except Exception:
+                pass
+        await repo.delete_order_dispatch_messages(order_id=order.id)
+    except Exception:
+        pass
+
     full_order, _created_by, assigned_master = await repo.get_order_with_users(order.id)
     if assigned_master:
         try:
@@ -1491,6 +1609,14 @@ async def admin_unassign_master(cb: CallbackQuery, bot: Bot, cfg: Config):
         f"↩️ Мастер снят с заявки <b>#{order.id}</b>. Статус возвращён в <b>{order_status_label(order.status)}</b>.",
         parse_mode=ParseMode.HTML,
     )
+
+    # После снятия мастера заявка снова NEW — пересылаем мастерам по текущей технике/городу.
+    try:
+        sent = await _refresh_dispatch_for_order_if_needed(order.id, bot=bot, cfg=cfg)
+        if sent:
+            await cb.message.answer(f"📨 Заявка снова доступна мастерам: отправлено <b>{sent}</b> уведомлений.", parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
     await cb.answer("Ок")
     await _notify_admins(bot, cfg, f"↩️ Мастер снят с заявки <b>#{order.id}</b> (возврат в NEW).")
 
@@ -1509,7 +1635,7 @@ async def _get_user_or_ask_start(message: Message):
 
 
 # ------------------------
-# ADMIN: подтвердить оплату (ТОЛЬКО SUPER_ADMIN)
+# ADMIN: подтвердить оплату (SUPER_ADMIN / DISPATCHER)
 # ------------------------
 @router.callback_query(F.data.startswith("order_admin_paid:"))
 async def admin_mark_paid(cb: CallbackQuery, bot: Bot, cfg: Config):
@@ -1518,7 +1644,7 @@ async def admin_mark_paid(cb: CallbackQuery, bot: Bot, cfg: Config):
 
     u = await repo.get_user_by_tg_id(cb.from_user.id)
     if not u or u.role not in (Role.SUPER_ADMIN, Role.DISPATCHER):
-        await cb.answer("Только диспетчер или супер-админ может подтверждать оплату", show_alert=True)
+        await cb.answer("Только супер-админ или диспетчер может подтверждать оплату", show_alert=True)
         return
     if u.role == Role.FIRED:
         await cb.answer("Доступ заблокирован", show_alert=True)
