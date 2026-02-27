@@ -1,0 +1,6 @@
+aiogram==3.6.0
+SQLAlchemy==2.0.30
+aiosqlite==0.20.0
+PyYAML==6.0.1
+python-dateutil==2.9.0.post0
+openpyxl==3.1.5

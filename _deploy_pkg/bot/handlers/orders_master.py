@@ -1075,7 +1075,11 @@ async def _finalize_close(message: Message, state: FSMContext, bot: Bot, cfg: Co
 
     req_text = (req_text or "").strip()
     if req_text:
-        req = "\n\n<b>Реквизиты для сдачи:</b>\n" + html_escape(req_text)
+        req = "
+
+<b>Реквизиты для сдачи:</b>
+" + html_escape(req_text)
+
     await message.answer(
         "Теперь отправьте скрин перевода:" + req,
         reply_markup=_order_send_payout_kb(order.id),
@@ -1149,7 +1153,11 @@ async def order_payout_start(cb: CallbackQuery, state: FSMContext, cfg: Config):
 
     req_text = (req_text or "").strip()
     if req_text:
-        req = "\n\n<b>Реквизиты для сдачи:</b>\n" + html_escape(req_text)
+        req = "
+
+<b>Реквизиты для сдачи:</b>
+" + html_escape(req_text)
+
     hint = ""
     if amount is not None:
         hint = f"\nК сдаче: <b>{amount}</b>"
